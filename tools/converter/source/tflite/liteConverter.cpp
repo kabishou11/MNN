@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <functional>
+#include <stdint.h>
 #include "logkit.h"
 #include "flatbuffers/idl.h"
 #include "flatbuffers/minireflect.h"
@@ -23,6 +24,28 @@ static bool invalidTfliteIndex(const char* what, int index, int size) {
         return true;
     }
     return false;
+}
+
+// Keep in sync with MNN_MAX_TENSOR_DIM in source/core/TensorUtils.hpp
+static const int kMaxTfliteTensorDim = 9;
+static bool validTfliteShape(const std::vector<int>& shape) {
+    if ((int)shape.size() > kMaxTfliteTensorDim) {
+        return false;
+    }
+    int64_t prod = 1;
+    for (size_t i = 0; i < shape.size(); ++i) {
+        int d = shape[i];
+        if (d < -1) {
+            return false;
+        }
+        if (d > 0) {
+            if (prod > (int64_t)INT32_MAX / d) {
+                return false;
+            }
+            prod *= d;
+        }
+    }
+    return true;
 }
 
 class TfliteModel {
@@ -210,6 +233,11 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
     auto model                   = std::shared_ptr<TfliteModel>(new TfliteModel(model_name));
     model->readModel();
     auto& tfliteModel = model->get();
+    if (nullptr == tfliteModel) {
+        MNN_ERROR("[ERROR] Invalid TFLite Model:%s\n", inputModel.c_str());
+        MNNNetT.reset();
+        return 1;
+    }
 
     const auto& tfliteOpSet = tfliteModel->operator_codes;
     // const auto operatorCodesSize = tfliteOpSet.size();
@@ -220,10 +248,20 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
     // use the weight's data type of Conv2D|DepthwiseConv2D to decide quantizedModel mode
     int quantizedModel = 0;
     for (int i = 0; i < subGraphsSize; ++i) {
+        if (nullptr == tfliteModel->subgraphs[i]) {
+            MNN_ERROR("[ERROR] Invalid TFLite Model: null subgraph\n");
+            MNNNetT.reset();
+            return 1;
+        }
         const auto& ops     = tfliteModel->subgraphs[i]->operators;
         const auto& tensors = tfliteModel->subgraphs[i]->tensors;
         const int opNums    = static_cast<int>(ops.size());
         for (int j = 0; j < opNums; ++j) {
+            if (nullptr == ops[j]) {
+                MNN_ERROR("[ERROR] Invalid TFLite Model: null operator\n");
+                MNNNetT.reset();
+                return 1;
+            }
             const int opcodeIndex = ops[j]->opcode_index;
             if (invalidTfliteIndex("opcode", opcodeIndex, static_cast<int>(tfliteOpSet.size()))) {
                 MNNNetT.reset();
@@ -255,8 +293,21 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
     auto& buffers = tfliteModel->buffers;
 
     for (int i = 0; i < subGraphsSize; ++i) {
+        if (nullptr == tfliteModel->subgraphs[i]) {
+            MNN_ERROR("[ERROR] Invalid TFLite Model: null subgraph\n");
+            MNNNetT.reset();
+            return 1;
+        }
         const auto& ops     = tfliteModel->subgraphs[i]->operators;
         const auto& tensors = tfliteModel->subgraphs[i]->tensors;
+        for (size_t t = 0; t < tensors.size(); ++t) {
+            const auto* tensor = tfliteAt(tensors, static_cast<int>(t), "tensor");
+            if (nullptr == tensor || !validTfliteShape(tensor->shape)) {
+                MNN_ERROR("[ERROR] Invalid TFLite Model: tensor %zu has invalid shape\n", t);
+                MNNNetT.reset();
+                return 1;
+            }
+        }
 
         // set const
         std::vector<bool> extractedTensors(tfliteModel->subgraphs[i]->tensors.size(), false);
@@ -293,12 +344,22 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
             MNNNetT->outputName.push_back(outputTensor->name);
         }
         // tensor names
-        for (const auto& tensor : tensors) {
+        for (size_t t = 0; t < tensors.size(); ++t) {
+            const auto* tensor = tfliteAt(tensors, static_cast<int>(t), "tensor");
+            if (nullptr == tensor) {
+                MNNNetT.reset();
+                return 1;
+            }
             MNNNetT->tensorName.push_back(tensor->name);
         }
 
         const int opNums = ops.size();
         for (int j = 0; j < opNums; ++j) {
+            if (nullptr == ops[j]) {
+                MNN_ERROR("[ERROR] Invalid TFLite Model: null operator\n");
+                MNNNetT.reset();
+                return 1;
+            }
             const int opcodeIndex = ops[j]->opcode_index;
             if (invalidTfliteIndex("opcode", opcodeIndex, static_cast<int>(tfliteOpSet.size()))) {
                 MNNNetT.reset();
@@ -427,7 +488,7 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
                     return;
                 }
                 auto quant = tensor->quantization.get();
-                if (!quant) {
+                if (!quant || quant->scale.empty() || quant->zero_point.empty()) {
                     return;
                 }
                 std::unique_ptr<MNN::TensorDescribeT> tensorDescribe(new MNN::TensorDescribeT);
@@ -464,6 +525,11 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
         }
     }
 
+    if (MNNNetT->oplists.empty()) {
+        MNN_ERROR("[ERROR] Invalid TFLite Model: no operator\n");
+        MNNNetT.reset();
+        return 1;
+    }
     MNNNetT->sourceType = MNN::NetSource_TFLITE;
     MNNNetT->bizCode    = bizCode;
 
@@ -478,18 +544,28 @@ TfliteModel::~TfliteModel() {
 
 void TfliteModel::readModel() {
     std::ifstream inputFile(_modelName, std::ios::binary);
+    if (!inputFile) {
+        MNN_ERROR("[ERROR] Cannot open TFLite model: %s\n", _modelName.c_str());
+        return;
+    }
     inputFile.seekg(0, std::ios::end);
     const auto size = inputFile.tellg();
+    if (size <= 0) {
+        MNN_ERROR("[ERROR] Invalid TFLite Model: empty file\n");
+        return;
+    }
     inputFile.seekg(0, std::ios::beg);
 
     char* buffer = new char[size];
     inputFile.read(buffer, size);
     inputFile.close();
 
-    // verify model
+    // verify model; do not UnPack a failed buffer (LOG(FATAL) does not abort)
     flatbuffers::Verifier verify((uint8_t*)buffer, size);
     if (!tflite::VerifyModelBuffer(verify)) {
-        LOG(FATAL) << "TFlite model version ERROR!";
+        MNN_ERROR("[ERROR] Invalid TFLite Model buffer\n");
+        delete[] buffer;
+        return;
     }
 
     _tfliteModel = tflite::UnPackModel(buffer);
