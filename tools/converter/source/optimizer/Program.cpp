@@ -32,8 +32,9 @@ bool Program::createUnit(std::map<int, VARP>& varMap, std::vector<int>& inputInd
     auto outputIndexes = op->outputIndexes;
     for (int j = 0; j < outputIndexes.size(); ++j) {
         if (varMap.find(outputIndexes[j]) != varMap.end()) {
-            // Don't support multi op output to one index
-            return false;
+            // Output may already exist when a dependency was created recursively while
+            // visiting an earlier op in oplists (graph is not necessarily topologically sorted).
+            return true;
         }
     }
     invalidSet.insert(op);
